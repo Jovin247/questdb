@@ -24,16 +24,15 @@
 
 package io.questdb.cairo;
 
-import io.questdb.griffin.SqlException;
 import io.questdb.griffin.engine.ops.AlterOperation;
 import io.questdb.griffin.engine.ops.UpdateOperation;
 
 import java.io.Closeable;
 
 public interface TableWriterAPI extends Closeable {
-    long apply(AlterOperation operation, boolean contextAllowsAnyStructureChanges)  throws SqlException, AlterTableContextException;
+    long apply(AlterOperation operation, boolean contextAllowsAnyStructureChanges) throws AlterTableContextException;
 
-    long apply(UpdateOperation operation)  throws SqlException;
+    long apply(UpdateOperation operation);
 
     long truncate();
 
@@ -41,6 +40,8 @@ public interface TableWriterAPI extends Closeable {
     void close();
 
     long commit();
+
+    long commitWithLag();
 
     long commitWithLag(long commitLag);
 
@@ -50,9 +51,23 @@ public interface TableWriterAPI extends Closeable {
 
     CharSequence getTableName();
 
+    long getUncommittedRowCount();
+
     TableWriter.Row newRow();
 
     TableWriter.Row newRow(long timestamp);
 
     void rollback();
+
+    /**
+     * Returns safe watermark for the symbol count stored in the given column.
+     * The purpose of the watermark is to let ILP I/O threads (SymbolCache) to
+     * use symbol codes when serializing row data to be handled by the writer.
+     * <p>
+     * If the implementation doesn't require symbol count watermarks (e.g.
+     * TableWriter), it should return <code>-1</code>.
+     * <p>
+     * Implementations must be thread-safe.
+     */
+    int getSymbolCountWatermark(int columnIndex);
 }

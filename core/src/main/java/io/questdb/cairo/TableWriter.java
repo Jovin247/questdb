@@ -66,10 +66,8 @@ import static io.questdb.cairo.BitmapIndexUtils.keyFileName;
 import static io.questdb.cairo.BitmapIndexUtils.valueFileName;
 import static io.questdb.cairo.TableUtils.*;
 import static io.questdb.cairo.sql.AsyncWriterCommand.Error.*;
-import static io.questdb.cairo.wal.WalUtils.SEQ_DIR;
 import static io.questdb.cairo.wal.WalTxnType.*;
-import static io.questdb.cairo.wal.WalUtils.WAL_FORMAT_VERSION;
-import static io.questdb.cairo.wal.WalUtils.WAL_NAME_BASE;
+import static io.questdb.cairo.wal.WalUtils.*;
 import static io.questdb.tasks.TableWriterTask.*;
 
 public class TableWriter implements TableWriterAPI, TableWriterSPI, Closeable {
@@ -308,10 +306,10 @@ public class TableWriter implements TableWriterAPI, TableWriterSPI, Closeable {
             this.partitionFloorMethod = PartitionBy.getPartitionFloorMethod(partitionBy);
             this.partitionCeilMethod = PartitionBy.getPartitionCeilMethod(partitionBy);
             if (PartitionBy.isPartitioned(partitionBy)) {
-                partitionDirFmt = PartitionBy.getPartitionDirFormatMethod(partitionBy);
-                partitionTimestampHi = txWriter.getLastPartitionTimestamp();
+                this.partitionDirFmt = PartitionBy.getPartitionDirFormatMethod(partitionBy);
+                this.partitionTimestampHi = txWriter.getLastPartitionTimestamp();
             } else {
-                partitionDirFmt = null;
+                this.partitionDirFmt = null;
             }
             this.commitInterval = calculateCommitInterval();
 
@@ -760,12 +758,12 @@ public class TableWriter implements TableWriterAPI, TableWriterSPI, Closeable {
     }
 
     @Override
-    public long apply(AlterOperation operation, boolean contextAllowsAnyStructureChanges) throws AlterTableContextException, SqlException {
+    public long apply(AlterOperation operation, boolean contextAllowsAnyStructureChanges) throws AlterTableContextException {
         return operation.apply(this, contextAllowsAnyStructureChanges);
     }
 
     @Override
-    public long apply(UpdateOperation operation) throws SqlException {
+    public long apply(UpdateOperation operation) {
         return operation.apply(this, false);
     }
 
@@ -776,6 +774,7 @@ public class TableWriter implements TableWriterAPI, TableWriterSPI, Closeable {
         }
     }
 
+    @Override
     public long commit() {
         return commit(defaultCommitMode);
     }
@@ -784,10 +783,12 @@ public class TableWriter implements TableWriterAPI, TableWriterSPI, Closeable {
         return commit(commitMode, 0);
     }
 
+    @Override
     public long commitWithLag() {
         return commit(defaultCommitMode, metadata.getCommitLag());
     }
 
+    @Override
     public long commitWithLag(long lagMicros) {
         return commit(defaultCommitMode, lagMicros);
     }
@@ -1026,6 +1027,7 @@ public class TableWriter implements TableWriterAPI, TableWriterSPI, Closeable {
         return colTop > -1L ? colTop : defaultValue;
     }
 
+    @Override
     public long getCommitInterval() {
         return commitInterval;
     }
@@ -1128,6 +1130,7 @@ public class TableWriter implements TableWriterAPI, TableWriterSPI, Closeable {
         return txnScoreboard;
     }
 
+    @Override
     public long getUncommittedRowCount() {
         return (masterRef - committedMasterRef) >> 1;
     }
@@ -1250,6 +1253,7 @@ public class TableWriter implements TableWriterAPI, TableWriterSPI, Closeable {
         }
     }
 
+    // TODO this method doesn't work with PARTITION BY NONE, so we may need to fix it or reject creation of WAL tables with such
     public boolean processWalBlock(
             @Transient Path walPath,
             int timestampIndex,
@@ -1343,6 +1347,8 @@ public class TableWriter implements TableWriterAPI, TableWriterSPI, Closeable {
                 processWalSql(sqlInfo, sqlToOperation);
                 break;
             case TRUNCATE:
+                // TODO(puzpuzpuz): this implementation is broken because of ILP I/O threads' symbol cache
+                //                  and also concurrent table readers
                 truncate();
                 break;
             default:
@@ -1848,6 +1854,12 @@ public class TableWriter implements TableWriterAPI, TableWriterSPI, Closeable {
         }
     }
 
+    @Override
+    public long getMetaMaxUncommittedRows() {
+        return metadata.getMaxUncommittedRows();
+    }
+
+    @Override
     public void setMetaMaxUncommittedRows(int maxUncommittedRows) {
         try {
             commit();
@@ -1879,6 +1891,7 @@ public class TableWriter implements TableWriterAPI, TableWriterSPI, Closeable {
      * Does not accept structure changes, e.g. equivalent to tick(false)
      * Some tick calls can result into transaction commit.
      */
+    @Override
     public void tick() {
         tick(false);
     }
@@ -1972,10 +1985,17 @@ public class TableWriter implements TableWriterAPI, TableWriterSPI, Closeable {
         return txWriter.getTxn();
     }
 
+    @Override
     public void updateCommitInterval(double commitIntervalFraction, long commitIntervalDefault) {
         this.commitIntervalFraction = commitIntervalFraction;
         this.commitIntervalDefault = commitIntervalDefault;
         this.commitInterval = calculateCommitInterval();
+    }
+
+    @Override
+    public int getSymbolCountWatermark(int columnIndex) {
+        // We don't need the watermark for non-WAL tables.
+        return -1;
     }
 
     public void upsertColumnVersion(long partitionTimestamp, int columnIndex, long columnTop) {
@@ -4553,9 +4573,9 @@ public class TableWriter implements TableWriterAPI, TableWriterSPI, Closeable {
                     .I$();
             errorCode = STRUCTURE_CHANGE_NOT_ALLOWED;
             errorMsg = "async cmd cannot change table structure while writer is busy";
-        } catch (SqlException | CairoException ex) {
-            errorCode = SQL_OR_CAIRO_ERROR;
-            errorMsg = ex.getFlyweightMessage();
+        } catch (CairoException ex) {
+            errorCode = CAIRO_ERROR;
+            errorMsg = "async cmd failed: " + ex.getFlyweightMessage();
         } catch (Throwable ex) {
             LOG.error().$("error on processing async cmd [type=").$(cmdType)
                     .$(", tableName=").utf8(tableName)

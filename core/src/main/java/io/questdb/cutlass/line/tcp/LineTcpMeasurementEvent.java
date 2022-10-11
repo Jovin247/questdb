@@ -26,6 +26,7 @@ package io.questdb.cutlass.line.tcp;
 
 import io.questdb.cairo.*;
 import io.questdb.cutlass.line.LineProtoTimestampAdapter;
+import io.questdb.griffin.engine.ops.AlterOperationBuilder;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.std.Misc;
@@ -48,9 +49,12 @@ class LineTcpMeasurementEvent implements Closeable {
     private final boolean symbolAsFieldSupported;
     private final int maxColumnNameLength;
     private final boolean autoCreateNewColumns;
+    private final int defaultSymbolCapacity;
+    private final boolean defaultSymbolCacheFlag;
     private int writerWorkerId;
     private TableUpdateDetails tableUpdateDetails;
     private boolean commitOnWriterClose;
+    private final AlterOperationBuilder addColumnBuilder = new AlterOperationBuilder();
 
     LineTcpMeasurementEvent(
             long bufLo,
@@ -61,7 +65,9 @@ class LineTcpMeasurementEvent implements Closeable {
             boolean stringToCharCastAllowed,
             boolean symbolAsFieldSupported,
             int maxColumnNameLength,
-            boolean autoCreateNewColumns
+            boolean autoCreateNewColumns,
+            int defaultSymbolCapacity,
+            boolean defaultSymbolCacheFlag
     ) {
         this.maxColumnNameLength = maxColumnNameLength;
         this.autoCreateNewColumns = autoCreateNewColumns;
@@ -71,6 +77,8 @@ class LineTcpMeasurementEvent implements Closeable {
         this.defaultColumnTypes = defaultColumnTypes;
         this.stringToCharCastAllowed = stringToCharCastAllowed;
         this.symbolAsFieldSupported = symbolAsFieldSupported;
+        this.defaultSymbolCapacity = defaultSymbolCapacity;
+        this.defaultSymbolCacheFlag = defaultSymbolCacheFlag;
     }
 
     @Override
@@ -94,7 +102,7 @@ class LineTcpMeasurementEvent implements Closeable {
     void append() throws CommitFailedException {
         TableWriter.Row row = null;
         try {
-            TableWriter writer = tableUpdateDetails.getWriter();
+            TableWriterAPI writer = tableUpdateDetails.getWriter();
             long offset = buffer.getAddress();
             long timestamp = buffer.readLong(offset);
             offset += Long.BYTES;
@@ -130,7 +138,21 @@ class LineTcpMeasurementEvent implements Closeable {
                         row.cancel();
                         row = null;
                         final int colType = defaultColumnTypes.MAPPED_COLUMN_TYPES[entityType];
-                        writer.addColumn(columnName, colType);
+                        // we have to commit before adding a new column as WalWriter doesn't do that automatically
+                        writer.commit();
+                        try {
+                            addColumnBuilder.clear();
+                            addColumnBuilder.ofAddColumn(0, tableUpdateDetails.getTableNameUtf16(), 0);
+                            addColumnBuilder.ofAddColumn(columnName, colType, defaultSymbolCapacity, defaultSymbolCacheFlag, false, 0);
+                            writer.apply(addColumnBuilder.build(), true);
+                        } catch (CairoException e) {
+                            colIndex = writer.getMetadata().getColumnIndexQuiet(columnName);
+                            if (colIndex < 0) {
+                                // the column is still not there, something must be wrong
+                                throw e;
+                            }
+                            // all good, someone added the column concurrently
+                        }
 
                         // Seek to beginning of entities
                         offset = Long.BYTES + Integer.BYTES + buffer.getAddress();

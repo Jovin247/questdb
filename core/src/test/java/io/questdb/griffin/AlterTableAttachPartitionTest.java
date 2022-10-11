@@ -255,7 +255,7 @@ public class AlterTableAttachPartitionTest extends AbstractGriffinTest {
                     compile(alterCommand, sqlExecutionContext);
                     Assert.fail();
                 } catch (SqlException e) {
-                    Assert.assertEquals("[24] failed to attach partition '2020-01-01': "+ATTACH_ERR_MISSING_PARTITION.name(), e.getMessage());
+                    Assert.assertEquals("[24] table 'dst9' could not be altered: [-1] failed to attach partition '2020-01-01': "+ATTACH_ERR_MISSING_PARTITION.name(), e.getMessage());
                 }
             }
         });
@@ -275,7 +275,7 @@ public class AlterTableAttachPartitionTest extends AbstractGriffinTest {
                     compile(alterCommand, sqlExecutionContext);
                     Assert.fail();
                 } catch (SqlException e) {
-                    Assert.assertEquals("[25] failed to attach partition '2020-01-01': "+ATTACH_ERR_MISSING_PARTITION.name(), e.getMessage());
+                    Assert.assertEquals("[25] table 'dst10' could not be altered: [-1] failed to attach partition '2020-01-01': "+ATTACH_ERR_MISSING_PARTITION.name(), e.getMessage());
                 }
             }
         });
@@ -309,7 +309,7 @@ public class AlterTableAttachPartitionTest extends AbstractGriffinTest {
                     compile("ALTER TABLE " + dst.getName() + " ATTACH PARTITION LIST '2020-01-02'", sqlExecutionContext);
                     Assert.fail();
                 } catch (SqlException e) {
-                    TestUtils.assertContains(e.getMessage(), "[25] failed to attach partition '2020-01-02': " + ATTACH_ERR_MISSING_PARTITION.name());
+                    TestUtils.assertContains(e.getMessage(), "[25] table 'dst11' could not be altered: [-1] failed to attach partition '2020-01-02': " + ATTACH_ERR_MISSING_PARTITION.name());
                 }
             }
         });
@@ -922,7 +922,7 @@ public class AlterTableAttachPartitionTest extends AbstractGriffinTest {
                     compile(alterCommand, sqlExecutionContext);
                     Assert.fail();
                 } catch (SqlException e) {
-                    Assert.assertEquals("[25] failed to attach partition '2022-08-09': "+ ATTACH_ERR_PARTITION_EXISTS.name(), e.getMessage());
+                    Assert.assertEquals("[25] table 'dst42' could not be altered: [-1] failed to attach partition '2022-08-09': "+ ATTACH_ERR_PARTITION_EXISTS.name(), e.getMessage());
                 }
             }
         });

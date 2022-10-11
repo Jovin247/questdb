@@ -26,11 +26,10 @@ package io.questdb.cairo.wal;
 
 import io.questdb.cairo.*;
 import io.questdb.cairo.security.AllowAllCairoSecurityContext;
+import io.questdb.cairo.wal.seq.TableMetadataChangeLog;
 import io.questdb.cairo.wal.seq.TableSequencerAPI;
 import io.questdb.cairo.wal.seq.TableTransactionLog;
 import io.questdb.cairo.wal.seq.TransactionLogCursor;
-import io.questdb.cairo.wal.seq.TableMetadataChangeLog;
-import io.questdb.griffin.SqlException;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.mp.AbstractQueueConsumerJob;
@@ -190,10 +189,10 @@ public class ApplyWal2TableJob extends AbstractQueueConsumerJob<WalTxnNotificati
                         if (hasNext) {
                             try {
                                 structuralChangeCursor.next().apply(writer, true);
-                            } catch (SqlException e) {
-                                throw CairoException.critical(0)
+                            } catch (CairoException e) {
+                                throw CairoException.critical(0, e)
                                         .put("cannot apply structure change from WAL to table [error=")
-                                        .put(e.getFlyweightMessage()).put(']');
+                                        .putCauseMessage().put(']');
                             }
                         } else {
                             // Something messed up in sequencer.

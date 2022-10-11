@@ -52,11 +52,17 @@ public class TableSequencerAPI extends AbstractPool {
     private final ConcurrentHashMap<TableSequencerEntry> seqRegistry = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<WalWriterPool> walRegistry = new ConcurrentHashMap<>();
     private final CairoEngine engine;
+    private PoolListener poolListener;
 
     public TableSequencerAPI(CairoEngine engine, CairoConfiguration configuration) {
         super(configuration, configuration.getInactiveWriterTTL()); //todo: separate config option
         this.engine = engine;
         notifyListener(Thread.currentThread().getId(), "TableSequencerAPI", PoolListener.EV_POOL_OPEN);
+    }
+
+    public void setPoolListener(PoolListener eventListener) {
+        this.poolListener = eventListener;
+        walRegistry.forEach((tableName, pool) -> pool.setEventListener(eventListener));
     }
 
     public void copyMetadataTo(final CharSequence tableName, final SequencerMetadata metadata) {
@@ -140,13 +146,16 @@ public class TableSequencerAPI extends AbstractPool {
         }
     }
 
-    // Check if sequencer files exist, e.g. is it WAL table sequencer must exist
+    /**
+     * Check if sequencer files exist, e.g. is it WAL table sequencer must exist
+     */
     private static boolean isWalTable(final CharSequence tableName, final CharSequence root, final FilesFacade ff) {
         Path path = Path.getThreadLocal2(root);
         return isWalTable(tableName, path, ff);
     }
 
-    private static boolean isWalTable(final CharSequence tableName, final Path root, final FilesFacade ff) {
+    // kept visible for tests
+    public static boolean isWalTable(final CharSequence tableName, final Path root, final FilesFacade ff) {
         root.concat(tableName).concat(SEQ_DIR);
         return ff.exists(root.$());
     }
@@ -170,7 +179,7 @@ public class TableSequencerAPI extends AbstractPool {
         // todo: GC again
         final String tableNameStr = Chars.toString(tableName);
         return walRegistry.computeIfAbsent(tableNameStr, key
-                -> new WalWriterPool(tableNameStr, this, engine.getConfiguration()));
+                -> new WalWriterPool(tableNameStr, this, engine.getConfiguration(), poolListener));
     }
 
     private @NotNull TableSequencerImpl openSequencer(final CharSequence tableName) {
@@ -303,12 +312,25 @@ public class TableSequencerAPI extends AbstractPool {
         private final String tableName;
         private final TableSequencerAPI tableSequencerAPI;
         private final CairoConfiguration configuration;
+        private PoolListener eventListener;
         private volatile boolean closed;
 
-        public WalWriterPool(String tableName, TableSequencerAPI tableSequencerAPI, CairoConfiguration configuration) {
+        public WalWriterPool(String tableName, TableSequencerAPI tableSequencerAPI, CairoConfiguration configuration, PoolListener eventListener) {
             this.tableName = tableName;
             this.tableSequencerAPI = tableSequencerAPI;
             this.configuration = configuration;
+            this.eventListener = eventListener;
+            notifyListener(Thread.currentThread().getId(), null, PoolListener.EV_POOL_OPEN);
+        }
+
+        public void setEventListener(PoolListener eventListener) {
+            this.eventListener = eventListener;
+        }
+
+        private void notifyListener(long thread, CharSequence name, short event) {
+            if (eventListener != null) {
+                eventListener.onEvent(PoolListener.SRC_WRITER, thread, name, event, (short) 0, (short) 0);
+            }
         }
 
         public Entry get() {
@@ -320,6 +342,7 @@ public class TableSequencerAPI extends AbstractPool {
 
                     if (obj == null) {
                         obj = new Entry(tableName, tableSequencerAPI, configuration, this);
+                        notifyListener(Thread.currentThread().getId(), tableName, PoolListener.EV_CREATE);
                     } else {
                         if (!obj.goActive()) {
                             obj = Misc.free(obj);
@@ -353,6 +376,7 @@ public class TableSequencerAPI extends AbstractPool {
                     }
                     cache.push(obj);
                     obj.releaseTime = configuration.getMicrosecondClock().getTicks();
+                    notifyListener(Thread.currentThread().getId(), tableName, PoolListener.EV_RETURN);
                     return true;
                 }
             } finally {

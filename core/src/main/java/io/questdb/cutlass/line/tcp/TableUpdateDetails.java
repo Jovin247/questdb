@@ -28,6 +28,7 @@ import io.questdb.cairo.*;
 import io.questdb.cairo.security.AllowAllCairoSecurityContext;
 import io.questdb.cairo.sql.SymbolLookup;
 import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.cairo.wal.TableWriterSPI;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.std.*;
@@ -52,11 +53,14 @@ public class TableUpdateDetails implements Closeable {
     private final CairoEngine engine;
     private final MillisecondClock millisecondClock;
     private final long writerTickRowsCountMod;
+    private final long defaultCommitInterval;
+    private final long defaultMaxUncommittedRows;
     private int writerThreadId;
     // Number of rows processed since the last reshuffle, this is an estimate because it is incremented by
     // multiple threads without synchronisation
     private long eventsProcessedSinceReshuffle = 0;
-    private TableWriter writer;
+    private TableWriterAPI writerAPI;
+    private TableWriterSPI writerSPI;
     private boolean assignedToJob = false;
     private long lastMeasurementMillis = Long.MAX_VALUE;
     private long nextCommitTime;
@@ -66,7 +70,7 @@ public class TableUpdateDetails implements Closeable {
     TableUpdateDetails(
             LineTcpReceiverConfiguration configuration,
             CairoEngine engine,
-            TableWriter writer,
+            TableWriterAPI writer,
             int writerThreadId,
             NetworkIOJob[] netIoJobs,
             DefaultColumnTypes defaultColumnTypes
@@ -75,20 +79,31 @@ public class TableUpdateDetails implements Closeable {
         this.engine = engine;
         this.defaultColumnTypes = defaultColumnTypes;
         final int n = netIoJobs.length;
+        CairoConfiguration cairoConfiguration = engine.getConfiguration();
+        this.millisecondClock = cairoConfiguration.getMillisecondClock();
+        this.writerTickRowsCountMod = cairoConfiguration.getWriterTickRowsCountMod();
+        this.defaultCommitInterval = configuration.getCommitIntervalDefault();
+        this.defaultMaxUncommittedRows = cairoConfiguration.getMaxUncommittedRows();
+        this.writerAPI = writer;
+        BaseRecordMetadata metadata = writer.getMetadata();
+        this.timestampIndex = metadata.getTimestampIndex();
+        this.tableNameUtf16 = Chars.toString(writer.getTableName());
+        if (writer instanceof TableWriterSPI) {
+            writerSPI = (TableWriterSPI) writer;
+            writerSPI.updateCommitInterval(configuration.getCommitIntervalFraction(), configuration.getCommitIntervalDefault());
+            this.nextCommitTime = millisecondClock.getTicks() + writerSPI.getCommitInterval();
+        } else {
+            writerSPI = null;
+            this.nextCommitTime = millisecondClock.getTicks() + defaultCommitInterval;
+        }
         this.localDetailsArray = new ThreadLocalDetails[n];
         for (int i = 0; i < n; i++) {
             this.localDetailsArray[i] = new ThreadLocalDetails(
-                    configuration, netIoJobs[i].getUnusedSymbolCaches(), writer.getMetadata().getColumnCount());
+                    configuration,
+                    netIoJobs[i].getUnusedSymbolCaches(),
+                    writer.getMetadata().getColumnCount()
+            );
         }
-        CairoConfiguration cairoConfiguration = engine.getConfiguration();
-        TableWriterMetadata metadata = writer.getMetadata();
-        this.millisecondClock = cairoConfiguration.getMillisecondClock();
-        this.writerTickRowsCountMod = cairoConfiguration.getWriterTickRowsCountMod();
-        this.writer = writer;
-        this.timestampIndex = metadata.getTimestampIndex();
-        this.tableNameUtf16 = writer.getTableName();
-        writer.updateCommitInterval(configuration.getCommitIntervalFraction(), configuration.getCommitIntervalDefault());
-        this.nextCommitTime = millisecondClock.getTicks() + writer.getCommitInterval();
     }
 
     public void addReference(int workerId) {
@@ -98,7 +113,6 @@ public class TableUpdateDetails implements Closeable {
                 .$(", tableName=").$(tableNameUtf16)
                 .$(", nNetworkIoWorkers=").$(networkIOOwnerCount)
                 .$(']').$();
-
     }
 
     public boolean isWriterInError() {
@@ -127,16 +141,17 @@ public class TableUpdateDetails implements Closeable {
         if (writerThreadId != Integer.MIN_VALUE) {
             LOG.info().$("closing table writer [tableName=").$(tableNameUtf16).$(']').$();
             closeLocals();
-            if (null != writer) {
+            if (null != writerAPI) {
                 try {
                     if (!writerInError) {
-                        writer.commit();
+                        writerAPI.commit();
                     }
                 } catch (Throwable ex) {
                     LOG.error().$("cannot commit writer transaction, rolling back before releasing it [table=").$(tableNameUtf16).$(",ex=").$(ex).I$();
                 } finally {
                     // returning to pool rolls back the transaction
-                    writer = Misc.free(writer);
+                    writerAPI = Misc.free(writerAPI);
+                    writerSPI = null;
                 }
             }
             writerThreadId = Integer.MIN_VALUE;
@@ -186,25 +201,39 @@ public class TableUpdateDetails implements Closeable {
     }
 
     public void tick() {
-        if (writer != null) {
-            writer.tick();
+        if (writerSPI != null) {
+            writerSPI.tick();
         }
     }
 
+    private long getCommitInterval() {
+        if (writerSPI != null) {
+            return writerSPI.getCommitInterval();
+        }
+        return defaultCommitInterval;
+    }
+
+    private long getMetaMaxUncommittedRows() {
+        if (writerSPI != null) {
+            return writerSPI.getMetaMaxUncommittedRows();
+        }
+        return defaultMaxUncommittedRows;
+    }
+
     private void commit(boolean withLag) throws CommitFailedException {
-        if (writer.getUncommittedRowCount() > 0) {
+        if (writerAPI.getUncommittedRowCount() > 0) {
             try {
-                LOG.debug().$("time-based commit " + (withLag ? "with lag " : "") + "[rows=").$(writer.getUncommittedRowCount()).$(", table=").$(tableNameUtf16).I$();
+                LOG.debug().$("time-based commit " + (withLag ? "with lag " : "") + "[rows=").$(writerAPI.getUncommittedRowCount()).$(", table=").$(tableNameUtf16).I$();
                 if (withLag) {
-                    writer.commitWithLag();
+                    writerAPI.commitWithLag();
                 } else {
-                    writer.commit();
+                    writerAPI.commit();
                 }
             } catch (Throwable ex) {
                 setWriterInError();
                 LOG.error().$("could not commit [table=").$(tableNameUtf16).$(", e=").$(ex).I$();
                 try {
-                    writer.rollback();
+                    writerAPI.rollback();
                 } catch (Throwable th) {
                     LOG.error().$("could not perform emergency rollback [table=").$(tableNameUtf16).$(", e=").$(th).I$();
                 }
@@ -217,8 +246,8 @@ public class TableUpdateDetails implements Closeable {
         if (wallClockMillis < nextCommitTime) {
             return nextCommitTime;
         }
-        if (writer != null) {
-            final long commitInterval = writer.getCommitInterval();
+        if (writerAPI != null) {
+            final long commitInterval = getCommitInterval();
             long start = millisecondClock.getTicks();
             commit(wallClockMillis - lastMeasurementMillis < commitInterval);
             // Do not commit row by row if the commit takes longer than commitInterval.
@@ -229,31 +258,31 @@ public class TableUpdateDetails implements Closeable {
     }
 
     void commitIfMaxUncommittedRowsCountReached() throws CommitFailedException {
-        final long rowsSinceCommit = writer.getUncommittedRowCount();
-        if (rowsSinceCommit < writer.getMetadata().getMaxUncommittedRows()) {
+        final long rowsSinceCommit = writerAPI.getUncommittedRowCount();
+        if (rowsSinceCommit < getMetaMaxUncommittedRows()) {
             if ((rowsSinceCommit & writerTickRowsCountMod) == 0) {
                 // Tick without commit. Some tick commands may force writer to commit though.
-                writer.tick();
+                tick();
             }
             return;
         }
         LOG.debug().$("max-uncommitted-rows commit with lag [").$(tableNameUtf16).I$();
-        nextCommitTime = millisecondClock.getTicks() + writer.getCommitInterval();
+        nextCommitTime = millisecondClock.getTicks() + getCommitInterval();
 
         try {
-            writer.commitWithLag();
+            writerAPI.commitWithLag();
         } catch (Throwable th) {
             LOG.error()
-                    .$("could not commit line protocol measurement [tableName=").$(writer.getTableName())
+                    .$("could not commit line protocol measurement [tableName=").$(writerAPI.getTableName())
                     .$(", message=").$(th.getMessage())
                     .$(th)
                     .I$();
-            writer.rollback();
+            writerAPI.rollback();
             throw CommitFailedException.instance(th);
         }
 
         // Tick after commit.
-        writer.tick();
+        tick();
     }
 
     ThreadLocalDetails getThreadLocalDetails(int workerId) {
@@ -265,23 +294,24 @@ public class TableUpdateDetails implements Closeable {
         return timestampIndex;
     }
 
-    TableWriter getWriter() {
-        return writer;
+    TableWriterAPI getWriter() {
+        return writerAPI;
     }
 
     void releaseWriter(boolean commit) {
-        if (writer != null) {
+        if (writerAPI != null) {
             try {
                 if (commit) {
                     LOG.debug().$("release commit [table=").$(tableNameUtf16).I$();
-                    writer.commit();
+                    writerAPI.commit();
                 }
             } catch (Throwable ex) {
                 LOG.error().$("writer commit fails, force closing it [table=").$(tableNameUtf16).$(",ex=").$(ex).I$();
             } finally {
                 // writer or FS can be in a bad state
                 // do not leave writer locked
-                writer = Misc.free(writer);
+                writerAPI = Misc.free(writerAPI);
+                writerSPI = null;
             }
         }
     }
@@ -314,7 +344,11 @@ public class TableUpdateDetails implements Closeable {
         private boolean clean = true;
         private String symbolNameTemp;
 
-        ThreadLocalDetails(LineTcpReceiverConfiguration configuration, ObjList<SymbolCache> unusedSymbolCaches, int columnCount) {
+        ThreadLocalDetails(
+                LineTcpReceiverConfiguration configuration,
+                ObjList<SymbolCache> unusedSymbolCaches,
+                int columnCount
+        ) {
             this.configuration = configuration;
             // symbol caches are passed from the outside
             // to provide global lifecycle management for when ThreadLocalDetails cease to exist
@@ -360,7 +394,16 @@ public class TableUpdateDetails implements Closeable {
 
                 long columnNameTxn = reader.getColumnVersionReader().getDefaultColumnNameTxn(colWriterIndex);
                 assert symIndex <= colWriterIndex;
-                symCache.of(engine.getConfiguration(), path, symbolNameTemp, symIndex, txReader, columnNameTxn);
+                symCache.of(
+                        engine.getConfiguration(),
+                        writerAPI,
+                        colWriterIndex,
+                        path,
+                        symbolNameTemp,
+                        symIndex,
+                        txReader,
+                        columnNameTxn
+                );
                 symbolCacheByColumnIndex.extendAndSet(colWriterIndex, symCache);
                 return symCache;
             }
